@@ -235,11 +235,12 @@ def step2_postgresql(df, config, logger, progress_callback=None):
 
 # ─── STEP 3 : Push HubSpot ───────────────────────────────────────────────────
 
-def step3_hubspot(df, config, logger, list_name, progress_callback=None):
+def step3_hubspot(df, config, logger, list_name, progress_callback=None, task_owners=None):
     session = create_session(config)
     base_url = 'https://api.hubapi.com/crm/v3/objects'
     batch_size = config.get('batch', {}).get('contacts_size', 100)
-    task_owners = config.get('task_owners', [])
+    if task_owners is None:
+        task_owners = config.get('task_owners', [])
     results = {'contacts': 0, 'tasks': 0, 'list_id': None, 'errors': []}
 
     # ── 3.1 Contacts (batch create) ──
@@ -424,18 +425,25 @@ def main():
         st.header("Configuration")
         st.markdown(f"**HubSpot** : `...{config['hubspot']['api_key'][-8:]}`")
         st.markdown(f"**PostgreSQL** : `{config['postgresql']['host'][:25]}...`")
-        st.markdown(f"**Agents taches** : {len(config.get('task_owners', []))}")
         st.divider()
         st.markdown("Modifiez `config.yaml` pour changer les parametres.")
 
-        # Afficher les owners
-        with st.expander("Agents (taches)"):
-            for o in config.get('task_owners', []):
-                st.markdown(f"- {o['name']} (`{o['id']}`)")
+        # Checkboxes pour selectionner les agents
+        st.subheader("Agents (repartition taches)")
+        all_owners = config.get('task_owners', []) + config.get('excluded_owners', [])
+        active_ids = {o['id'] for o in config.get('task_owners', [])}
 
-        with st.expander("Owners exclus"):
-            for o in config.get('excluded_owners', []):
-                st.markdown(f"- {o['name']} (`{o['id']}`)")
+        selected_owners = []
+        for owner in all_owners:
+            checked = st.checkbox(
+                f"{owner['name']}",
+                value=(owner['id'] in active_ids),
+                key=f"owner_{owner['id']}"
+            )
+            if checked:
+                selected_owners.append(owner)
+
+        st.caption(f"{len(selected_owners)} agent(s) selectionne(s)")
 
     # Upload fichier
     uploaded = st.file_uploader(
@@ -533,7 +541,7 @@ def main():
                         progress3.progress(min(pct, 1.0))
                         msg3.text(msg)
 
-                    res = step3_hubspot(df, config, logger, list_name, cb3)
+                    res = step3_hubspot(df, config, logger, list_name, cb3, task_owners=selected_owners)
 
                     status.update(
                         label=f"Etape 3 terminee ({res['contacts']} contacts, {res['tasks']} taches)",
