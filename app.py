@@ -259,6 +259,131 @@ def validate_excel(df):
     return is_valid, errors, warnings, infos
 
 
+# ─── DETECTION DOUBLONS HUBSPOT ──────────────────────────────────────────────
+
+def detect_hubspot_duplicates(df, config):
+    """
+    Cherche les contacts existants dans HubSpot par CustomerName (firstname).
+    Retourne un dict: {customer_name: [list of hubspot contact ids]}
+    """
+    session = create_session(config)
+    customer_names = df['CustomerName'].dropna().astype(str).str.strip()
+    customer_names = customer_names[customer_names != ''].unique().tolist()
+
+    duplicates = {}  # name -> [{'id': ..., 'firstname': ..., 'lastname': ...}]
+
+    for name in customer_names:
+        try:
+            resp = session.post(
+                'https://api.hubapi.com/crm/v3/objects/contacts/search',
+                json={
+                    'filterGroups': [{
+                        'filters': [{
+                            'propertyName': 'firstname',
+                            'operator': 'EQ',
+                            'value': name
+                        }]
+                    }],
+                    'properties': ['firstname', 'lastname', 'login'],
+                    'limit': 10
+                },
+                timeout=15
+            )
+            if resp.status_code == 200:
+                results = resp.json().get('results', [])
+                if results:
+                    duplicates[name] = [{
+                        'id': r['id'],
+                        'firstname': r.get('properties', {}).get('firstname', ''),
+                        'lastname': r.get('properties', {}).get('lastname', ''),
+                        'login': r.get('properties', {}).get('login', ''),
+                    } for r in results]
+            elif resp.status_code == 429:
+                time.sleep(2)
+        except Exception:
+            pass
+
+    return duplicates
+
+
+# ─── ROLLBACK (SUPPRESSION IMPORT) ──────────────────────────────────────────
+
+def rollback_hubspot(contact_ids, list_id, config, logger, progress_callback=None):
+    """
+    Supprime les contacts et la liste creee sur HubSpot.
+    Les taches associees aux contacts sont supprimees automatiquement par HubSpot.
+    """
+    session = create_session(config)
+    base_url = 'https://api.hubapi.com/crm/v3/objects'
+    deleted_contacts = 0
+    errors = []
+
+    # Supprimer la liste
+    if list_id and list_id not in ('', 'None', 'N/A'):
+        try:
+            resp = session.delete(f'https://api.hubapi.com/crm/v3/lists/{list_id}', timeout=15)
+            if resp.status_code in (200, 204):
+                logger.info(f"Rollback: liste {list_id} supprimee")
+            else:
+                logger.warning(f"Rollback: erreur suppression liste {list_id}: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Rollback: erreur liste: {e}")
+
+    # Supprimer les contacts par batch de 100
+    total = len(contact_ids)
+    for i in range(0, total, 100):
+        batch = contact_ids[i:i + 100]
+        inputs = [{'id': cid} for cid in batch]
+        try:
+            resp = session.post(
+                f'{base_url}/contacts/batch/archive',
+                json={'inputs': inputs},
+                timeout=30
+            )
+            if resp.status_code in (200, 204):
+                deleted_contacts += len(batch)
+            elif resp.status_code == 429:
+                time.sleep(11)
+                resp = session.post(
+                    f'{base_url}/contacts/batch/archive',
+                    json={'inputs': inputs}, timeout=30
+                )
+                if resp.status_code in (200, 204):
+                    deleted_contacts += len(batch)
+            else:
+                errors.append(f"Batch archive {i//100+1}: {resp.status_code}")
+                logger.warning(f"Rollback contacts batch {i//100+1}: {resp.status_code}")
+        except Exception as e:
+            errors.append(str(e))
+
+        if progress_callback:
+            progress_callback(min((i + 100) / total, 1.0), f"Suppression: {deleted_contacts}/{total}")
+
+    logger.info(f"Rollback: {deleted_contacts}/{total} contacts supprimes")
+    return deleted_contacts, errors
+
+
+def rollback_postgresql(import_date, config, logger):
+    """Supprime les lignes inserees dans PostgreSQL pour une date d'import donnee."""
+    pg = config['postgresql']
+    try:
+        conn = psycopg2.connect(
+            host=pg['host'], port=int(pg['port']),
+            dbname=pg['database'], user=pg['user'], password=pg['password']
+        )
+        cur = conn.cursor()
+        cur.execute(f"DELETE FROM {pg['table']} WHERE import_date = %s", (import_date,))
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info(f"Rollback PostgreSQL: {deleted} lignes supprimees (import_date={import_date})")
+        return deleted
+    except Exception as e:
+        logger.error(f"Rollback PostgreSQL erreur: {e}")
+        return 0
+
+
 # ─── STEP 1 : Transformer Excel ──────────────────────────────────────────────
 
 def step1_transform(df, logger):
@@ -506,6 +631,7 @@ def step3_hubspot(df, config, logger, list_name, progress_callback=None, task_ow
             progress_callback(pct, f"Taches: {task_success}/{len(jobs)}")
 
     results['tasks'] = task_success
+    results['contact_ids'] = contacts_done
     logger.info(f"Taches: {task_success} creees ({nb_owners} agents)")
 
     if progress_callback:
@@ -618,11 +744,85 @@ def main():
     with col3:
         do_step3 = st.checkbox("3. Push HubSpot", value=True)
 
-    # Bouton lancer
-    if st.button("Lancer l'import", type="primary", width='stretch'):
+    # ── Detection doublons HubSpot ──
+    if do_step3:
+        st.subheader("Verification des doublons HubSpot")
+        if st.button("Verifier les doublons (par CustomerName)", key="check_dup"):
+            with st.spinner("Recherche des doublons dans HubSpot..."):
+                duplicates = detect_hubspot_duplicates(df, config)
+            if duplicates:
+                st.warning(f"**{len(duplicates)} CustomerName(s) deja present(s) dans HubSpot.**")
+                dup_data = []
+                for name, contacts in duplicates.items():
+                    for c in contacts:
+                        dup_data.append({
+                            'CustomerName': name,
+                            'HubSpot ID': c['id'],
+                            'Firstname (HubSpot)': c['firstname'],
+                            'Lastname (HubSpot)': c['lastname'],
+                            'Login (HubSpot)': c['login'],
+                        })
+                st.session_state['duplicates'] = dup_data
+                st.dataframe(pd.DataFrame(dup_data), width='stretch')
+
+                st.session_state['dup_action'] = st.radio(
+                    "Que faire avec les doublons ?",
+                    ["Creer quand meme (doublons possibles)", "Ignorer les doublons (ne pas les re-creer)"],
+                    key="dup_radio"
+                )
+            else:
+                st.success("Aucun doublon detecte — tous les CustomerName sont nouveaux.")
+                st.session_state['dup_action'] = "Creer quand meme (doublons possibles)"
+                st.session_state['duplicates'] = []
+
+    # ── Preview / Resume avant import ──
+    st.subheader("Resume avant import")
+    list_name = os.path.splitext(filename)[0]
+
+    preview_cols = st.columns(2)
+    with preview_cols[0]:
+        st.markdown("**Actions prevues :**")
+        if do_step1:
+            st.markdown(f"- Transformation Excel ({len(df)} lignes)")
+        if do_step2:
+            st.markdown(f"- Push PostgreSQL → `{config['postgresql']['table']}`")
+        if do_step3:
+            st.markdown(f"- Push HubSpot : {len(df)} contacts + {len(df)} taches")
+            st.markdown(f"- Liste statique : `{list_name}`")
+
+    with preview_cols[1]:
+        if do_step3:
+            st.markdown("**Repartition des taches :**")
+            nb_owners = len(selected_owners)
+            if nb_owners > 0:
+                per_agent = len(df) // nb_owners
+                reste = len(df) % nb_owners
+                for i, o in enumerate(selected_owners):
+                    count = per_agent + (1 if i < reste else 0)
+                    st.markdown(f"- {o['name']} : ~{count} tache(s)")
+            else:
+                st.warning("Aucun agent selectionne !")
+
+    # ── Bouton Confirmer et Lancer ──
+    st.divider()
+    if not st.checkbox("J'ai verifie le resume ci-dessus et je confirme le lancement", key="confirm_check"):
+        st.stop()
+
+    if st.button("Confirmer et lancer l'import", type="primary", width='stretch'):
         logger, log_file = setup_logger(config, filename)
         logger.info(f"=== Debut import : {filename} ({len(df)} lignes) ===")
         start_time = time.time()
+
+        # Identifier les doublons a ignorer
+        skip_names = set()
+        if do_step3 and st.session_state.get('dup_action', '').startswith('Ignorer'):
+            dup_data = st.session_state.get('duplicates', [])
+            skip_names = {d['CustomerName'] for d in dup_data}
+            if skip_names:
+                orig_len = len(df)
+                df = df[~df['CustomerName'].astype(str).str.strip().isin(skip_names)]
+                logger.info(f"Doublons ignores: {orig_len - len(df)} lignes exclues ({len(skip_names)} noms)")
+                st.info(f"{orig_len - len(df)} doublon(s) ignore(s). Import de {len(df)} lignes.")
 
         # Step 1
         if do_step1:
@@ -631,10 +831,8 @@ def main():
                     df = step1_transform(df, logger)
                     status.update(label=f"Etape 1 terminee ({len(df)} lignes)", state="complete")
 
-                    # Apercu du fichier transforme
                     st.dataframe(df[['Nom', 'Adresse postale', 'AppointmentDate']].head(5), width='stretch')
 
-                    # Telecharger le fichier cleaned
                     buffer = BytesIO()
                     df.to_excel(buffer, index=False, engine='openpyxl')
                     buffer.seek(0)
@@ -672,8 +870,6 @@ def main():
                 progress3 = st.progress(0)
                 msg3 = st.empty()
                 try:
-                    list_name = os.path.splitext(filename)[0]
-
                     def cb3(pct, msg):
                         progress3.progress(min(pct, 1.0))
                         msg3.text(msg)
@@ -685,7 +881,16 @@ def main():
                         state="complete"
                     )
 
-                    # Resume
+                    # Stocker les resultats pour rollback
+                    st.session_state['last_import'] = {
+                        'contact_ids': list(res.get('contact_ids', {}).values()) if isinstance(res.get('contact_ids'), dict) else [],
+                        'list_id': res.get('list_id', ''),
+                        'import_date': str(date.today()),
+                        'contacts_count': res['contacts'],
+                        'tasks_count': res['tasks'],
+                        'filename': filename,
+                    }
+
                     col_a, col_b, col_c = st.columns(3)
                     col_a.metric("Contacts", res['contacts'])
                     col_b.metric("Taches", res['tasks'])
@@ -706,6 +911,47 @@ def main():
         st.divider()
         st.success(f"Import termine en **{elapsed:.1f} secondes** !")
         st.caption(f"Log sauvegarde : `{log_file}`")
+
+    # ── ROLLBACK : Annuler le dernier import ──
+    if 'last_import' in st.session_state and st.session_state['last_import']:
+        last = st.session_state['last_import']
+        st.divider()
+        st.subheader("Annuler le dernier import")
+        st.markdown(
+            f"Dernier import : **{last['filename']}** — "
+            f"{last['contacts_count']} contacts, {last['tasks_count']} taches, "
+            f"liste `{last.get('list_id', 'N/A')}`"
+        )
+        st.warning("Cette action est irreversible. Les contacts, taches associees et la liste seront supprimes de HubSpot. Les lignes PostgreSQL du jour seront aussi supprimees.")
+
+        if st.button("Annuler cet import (ROLLBACK)", type="secondary", key="rollback_btn"):
+            logger, log_file = setup_logger(config, f"ROLLBACK_{last['filename']}")
+            logger.info(f"=== ROLLBACK demande pour {last['filename']} ===")
+
+            with st.status("Rollback en cours...", expanded=True) as status:
+                # Rollback HubSpot
+                contact_ids = last.get('contact_ids', [])
+                if contact_ids:
+                    progress_rb = st.progress(0)
+                    msg_rb = st.empty()
+                    def cb_rb(pct, msg):
+                        progress_rb.progress(min(pct, 1.0))
+                        msg_rb.text(msg)
+                    deleted, rb_errors = rollback_hubspot(contact_ids, last.get('list_id', ''), config, logger, cb_rb)
+                    st.markdown(f"HubSpot : {deleted} contacts supprimes")
+                else:
+                    st.markdown("HubSpot : aucun contact_id enregistre, suppression manuelle necessaire.")
+
+                # Rollback PostgreSQL
+                import_date = last.get('import_date', '')
+                if import_date:
+                    pg_deleted = rollback_postgresql(import_date, config, logger)
+                    st.markdown(f"PostgreSQL : {pg_deleted} lignes supprimees (import_date={import_date})")
+
+                status.update(label="Rollback termine", state="complete")
+
+            st.session_state['last_import'] = None
+            logger.info("=== ROLLBACK termine ===")
 
 if __name__ == '__main__':
     main()
