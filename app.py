@@ -261,49 +261,88 @@ def validate_excel(df):
 
 # ─── DETECTION DOUBLONS HUBSPOT ──────────────────────────────────────────────
 
-def detect_hubspot_duplicates(df, config):
+def detect_hubspot_duplicates(df, config, progress_callback=None):
     """
-    Cherche les contacts existants dans HubSpot par CustomerName (firstname).
-    Retourne un dict: {customer_name: [list of hubspot contact ids]}
+    Recupere TOUS les contacts HubSpot en bulk (pagine), puis compare
+    localement avec les CustomerName du fichier Excel.
+    Beaucoup plus rapide que de chercher un par un.
     """
     session = create_session(config)
+
+    # 1. Recuperer tous les contacts HubSpot (pagine, 100 par page)
+    all_hs_contacts = []
+    after = None
+    page = 0
+
+    if progress_callback:
+        progress_callback(0.0, "Chargement des contacts HubSpot...")
+
+    while True:
+        params = {'limit': 100, 'properties': 'firstname,lastname,login'}
+        if after:
+            params['after'] = after
+
+        try:
+            resp = session.get(
+                'https://api.hubapi.com/crm/v3/objects/contacts',
+                params=params, timeout=20
+            )
+        except Exception:
+            break
+
+        if resp.status_code == 429:
+            time.sleep(int(resp.headers.get('Retry-After', 11)))
+            continue
+
+        if resp.status_code != 200:
+            break
+
+        data = resp.json()
+        results = data.get('results', [])
+        all_hs_contacts.extend(results)
+        page += 1
+
+        if progress_callback:
+            progress_callback(None, f"Contacts HubSpot charges : {len(all_hs_contacts)}...")
+
+        # Page suivante ?
+        paging = data.get('paging', {}).get('next', {})
+        after = paging.get('after')
+        if not after:
+            break
+
+    if progress_callback:
+        progress_callback(0.7, f"{len(all_hs_contacts)} contacts HubSpot charges. Comparaison...")
+
+    # 2. Construire un index par firstname
+    hs_by_firstname = {}
+    for c in all_hs_contacts:
+        props = c.get('properties', {})
+        fn = (props.get('firstname') or '').strip().lower()
+        if fn:
+            if fn not in hs_by_firstname:
+                hs_by_firstname[fn] = []
+            hs_by_firstname[fn].append({
+                'id': c['id'],
+                'firstname': props.get('firstname', ''),
+                'lastname': props.get('lastname', ''),
+                'login': props.get('login', ''),
+            })
+
+    # 3. Comparer avec le fichier Excel
     customer_names = df['CustomerName'].dropna().astype(str).str.strip()
     customer_names = customer_names[customer_names != ''].unique().tolist()
 
-    duplicates = {}  # name -> [{'id': ..., 'firstname': ..., 'lastname': ...}]
-
+    duplicates = {}
     for name in customer_names:
-        try:
-            resp = session.post(
-                'https://api.hubapi.com/crm/v3/objects/contacts/search',
-                json={
-                    'filterGroups': [{
-                        'filters': [{
-                            'propertyName': 'firstname',
-                            'operator': 'EQ',
-                            'value': name
-                        }]
-                    }],
-                    'properties': ['firstname', 'lastname', 'login'],
-                    'limit': 10
-                },
-                timeout=15
-            )
-            if resp.status_code == 200:
-                results = resp.json().get('results', [])
-                if results:
-                    duplicates[name] = [{
-                        'id': r['id'],
-                        'firstname': r.get('properties', {}).get('firstname', ''),
-                        'lastname': r.get('properties', {}).get('lastname', ''),
-                        'login': r.get('properties', {}).get('login', ''),
-                    } for r in results]
-            elif resp.status_code == 429:
-                time.sleep(2)
-        except Exception:
-            pass
+        key = name.strip().lower()
+        if key in hs_by_firstname:
+            duplicates[name] = hs_by_firstname[key]
 
-    return duplicates
+    if progress_callback:
+        progress_callback(1.0, f"Termine — {len(duplicates)} doublon(s) detecte(s)")
+
+    return duplicates, len(all_hs_contacts)
 
 
 # ─── ROLLBACK (SUPPRESSION IMPORT) ──────────────────────────────────────────
@@ -748,9 +787,19 @@ def main():
     if do_step3:
         st.subheader("Verification des doublons HubSpot")
         if st.button("Verifier les doublons (par CustomerName)", key="check_dup"):
-            with st.spinner("Recherche des doublons dans HubSpot..."):
-                duplicates = detect_hubspot_duplicates(df, config)
+            progress_dup = st.progress(0)
+            msg_dup = st.empty()
+
+            def cb_dup(pct, msg):
+                if pct is not None:
+                    progress_dup.progress(min(pct, 1.0))
+                msg_dup.text(msg)
+
+            duplicates, total_hs = detect_hubspot_duplicates(df, config, progress_callback=cb_dup)
+            progress_dup.progress(1.0)
+
             if duplicates:
+                msg_dup.text(f"Scan termine : {total_hs} contacts HubSpot analyses.")
                 st.warning(f"**{len(duplicates)} CustomerName(s) deja present(s) dans HubSpot.**")
                 dup_data = []
                 for name, contacts in duplicates.items():
@@ -771,6 +820,7 @@ def main():
                     key="dup_radio"
                 )
             else:
+                msg_dup.text(f"Scan termine : {total_hs} contacts HubSpot analyses.")
                 st.success("Aucun doublon detecte — tous les CustomerName sont nouveaux.")
                 st.session_state['dup_action'] = "Creer quand meme (doublons possibles)"
                 st.session_state['duplicates'] = []
