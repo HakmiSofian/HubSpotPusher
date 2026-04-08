@@ -24,10 +24,14 @@ from io import BytesIO
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.yaml')
 
-@st.cache_data
-def load_config():
+@st.cache_resource
+def _load_yaml():
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
+        return yaml.safe_load(f)
+
+def load_config():
+    import copy
+    config = copy.deepcopy(_load_yaml())
 
     # Surcharger les credentials avec les secrets Streamlit Cloud si disponibles
     # (permet de ne pas mettre les mots de passe dans config.yaml sur GitHub)
@@ -469,7 +473,7 @@ def main():
 
     # Apercu
     with st.expander("Apercu des donnees brutes", expanded=False):
-        st.dataframe(df.head(10), use_container_width=True)
+        st.dataframe(df.head(10), width='stretch')
 
     # Selection des etapes
     st.subheader("Etapes a executer")
@@ -482,7 +486,7 @@ def main():
         do_step3 = st.checkbox("3. Push HubSpot", value=True)
 
     # Bouton lancer
-    if st.button("Lancer l'import", type="primary", use_container_width=True):
+    if st.button("Lancer l'import", type="primary", width='stretch'):
         logger, log_file = setup_logger(config, filename)
         logger.info(f"=== Debut import : {filename} ({len(df)} lignes) ===")
         start_time = time.time()
@@ -495,7 +499,7 @@ def main():
                     status.update(label=f"Etape 1 terminee ({len(df)} lignes)", state="complete")
 
                     # Apercu du fichier transforme
-                    st.dataframe(df[['Nom', 'Adresse postale', 'AppointmentDate']].head(5), use_container_width=True)
+                    st.dataframe(df[['Nom', 'Adresse postale', 'AppointmentDate']].head(5), width='stretch')
 
                     # Telecharger le fichier cleaned
                     buffer = BytesIO()
