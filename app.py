@@ -155,6 +155,110 @@ def batch_request(session, url, payload, config, max_retries=3):
         return resp
     return resp
 
+# ─── VALIDATION FICHIER EXCEL ────────────────────────────────────────────────
+
+REQUIRED_COLUMNS = [
+    'WorkOrderId', 'WorkOrderExternalReference', 'CustomerName',
+    'Street', 'HouseNumber', 'ZipCode', 'City',
+    'Language', 'AppointmentDate', 'Login', 'Password',
+]
+
+IMPORTANT_COLUMNS = [
+    'E EAN Number', 'PostBox', 'Appointment Window',
+    'Login Url', 'GRD', 'CreationDate',
+]
+
+DATE_PATTERN = re.compile(
+    r'(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)?\s*'
+    r'\d{1,2}\s+'
+    r'(janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|'
+    r'septembre|octobre|novembre|décembre|decembre)\s+'
+    r'\d{4}',
+    re.IGNORECASE
+)
+
+def validate_excel(df):
+    """
+    Valide le fichier Excel.
+    Retourne (is_valid, errors, warnings, infos)
+    - errors   : bloquants, empechent l'import
+    - warnings : non bloquants, signalent des donnees manquantes
+    - infos    : statistiques utiles
+    """
+    errors = []
+    warnings = []
+    infos = []
+
+    # 1. Colonnes obligatoires manquantes
+    missing_required = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing_required:
+        errors.append(f"Colonnes obligatoires manquantes : **{', '.join(missing_required)}**")
+
+    # 2. Colonnes importantes absentes (non bloquant)
+    missing_important = [c for c in IMPORTANT_COLUMNS if c not in df.columns]
+    if missing_important:
+        warnings.append(f"Colonnes optionnelles absentes : {', '.join(missing_important)}")
+
+    # 3. Fichier vide
+    if len(df) == 0:
+        errors.append("Le fichier est vide (0 lignes de donnees).")
+        return False, errors, warnings, infos
+
+    # 4. Colonne Login : obligatoire et unique (cle HubSpot)
+    if 'Login' in df.columns:
+        null_login = df['Login'].isnull().sum() + (df['Login'].astype(str).str.strip() == '').sum()
+        if null_login > 0:
+            errors.append(f"Colonne **Login** : {null_login} valeur(s) vide(s). Login est obligatoire pour HubSpot.")
+        dup_login = df['Login'].astype(str).str.strip().duplicated(keep=False)
+        dup_count = dup_login.sum()
+        if dup_count > 0:
+            dup_vals = df.loc[dup_login, 'Login'].unique()[:5].tolist()
+            errors.append(f"Colonne **Login** : {dup_count} doublons detectes (ex: {', '.join(str(v) for v in dup_vals)}). Chaque contact doit avoir un Login unique.")
+
+    # 5. AppointmentDate : format date francaise
+    if 'AppointmentDate' in df.columns:
+        non_empty = df['AppointmentDate'].dropna().astype(str).str.strip()
+        non_empty = non_empty[non_empty != '']
+        if len(non_empty) == 0:
+            errors.append("Colonne **AppointmentDate** entièrement vide.")
+        else:
+            bad_dates = non_empty[~non_empty.str.lower().apply(lambda v: bool(DATE_PATTERN.search(v)))]
+            if len(bad_dates) > 0:
+                exemples = bad_dates.head(3).tolist()
+                warnings.append(
+                    f"Colonne **AppointmentDate** : {len(bad_dates)} date(s) au format non reconnu "
+                    f"(ex: `{'`, `'.join(exemples)}`). "
+                    f"Format attendu : `jeudi 23 avril 2026`."
+                )
+
+    # 6. CustomerName vide
+    if 'CustomerName' in df.columns:
+        null_name = df['CustomerName'].isnull().sum() + (df['CustomerName'].astype(str).str.strip() == '').sum()
+        if null_name > 0:
+            warnings.append(f"Colonne **CustomerName** : {null_name} valeur(s) vide(s).")
+
+    # 7. Lignes entièrement vides
+    empty_rows = df.isnull().all(axis=1).sum()
+    if empty_rows > 0:
+        warnings.append(f"{empty_rows} ligne(s) entièrement vide(s) dans le fichier.")
+
+    # 8. Stats informatives
+    infos.append(f"{len(df)} lignes au total")
+    if 'Login' in df.columns:
+        unique_logins = df['Login'].astype(str).str.strip().nunique()
+        infos.append(f"{unique_logins} logins uniques")
+    if 'AppointmentDate' in df.columns:
+        unique_dates = df['AppointmentDate'].dropna().astype(str).str.strip()
+        unique_dates = unique_dates[unique_dates != ''].nunique()
+        infos.append(f"{unique_dates} date(s) de RDV distincte(s)")
+    if 'City' in df.columns:
+        unique_cities = df['City'].dropna().nunique()
+        infos.append(f"{unique_cities} ville(s) distincte(s)")
+
+    is_valid = len(errors) == 0
+    return is_valid, errors, warnings, infos
+
+
 # ─── STEP 1 : Transformer Excel ──────────────────────────────────────────────
 
 def step1_transform(df, logger):
@@ -471,9 +575,38 @@ def main():
 
     st.success(f"**{filename}** charge — {len(df)} lignes, {len(df.columns)} colonnes")
 
-    # Apercu
+    # ── Validation du fichier ──
+    is_valid, val_errors, val_warnings, val_infos = validate_excel(df)
+
+    # Statistiques
+    if val_infos:
+        cols_info = st.columns(len(val_infos))
+        for i, info in enumerate(val_infos):
+            parts = info.split(' ', 1)
+            cols_info[i].metric(parts[1] if len(parts) > 1 else info, parts[0])
+
+    # Erreurs bloquantes
+    if val_errors:
+        st.error("**Le fichier contient des erreurs bloquantes. Corrigez-les avant de continuer.**")
+        for err in val_errors:
+            st.error(f"❌ {err}")
+
+    # Avertissements non bloquants
+    if val_warnings:
+        with st.expander(f"⚠️ {len(val_warnings)} avertissement(s) — non bloquant(s)", expanded=True):
+            for w in val_warnings:
+                st.warning(f"⚠️ {w}")
+
+    # Apercu des données
     with st.expander("Apercu des donnees brutes", expanded=False):
         st.dataframe(df.head(10), width='stretch')
+
+    # Bloquer si erreurs
+    if not is_valid:
+        st.info("Corrigez le fichier Excel puis re-deposez-le.")
+        st.stop()
+
+    st.success("✅ Fichier valide — vous pouvez lancer l'import.")
 
     # Selection des etapes
     st.subheader("Etapes a executer")
