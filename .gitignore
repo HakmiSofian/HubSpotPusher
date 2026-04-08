@@ -1,0 +1,11 @@
+# Ne pas pousser les secrets
+.env
+logs/
+*.log
+*_checkpoint.json
+*_cleaned.xlsx
+
+# Python
+__pycache__/
+*.pyc
+.venv/

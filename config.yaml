@@ -1,0 +1,114 @@
+# ============================================================================
+# CONFIGURATION - Import Contacts HubSpot / PostgreSQL
+# ============================================================================
+# Modifiez ce fichier pour adapter le comportement de l'application.
+# Pas besoin de toucher au code Python.
+
+# --- Credentials HubSpot ---
+hubspot:
+  api_key: "pat-eu1-a20f932c-4733-495d-9426-f12b380a3b36"
+
+# --- Credentials PostgreSQL ---
+postgresql:
+  host: "db-kartu-eu.canopjwke8sb.eu-central-1.rds.amazonaws.com"
+  port: 5432
+  database: "postgres"
+  user: "postgres"
+  password: "KeepCall"
+  table: "public.dataformails"
+
+# --- Step 1 : Transformation Excel ---
+# Colonnes a calculer dans le fichier cleaned
+excel:
+  # Colonne "Nom" = WorkOrderId + " - " + WorkOrderExternalReference
+  nom_formula: "{WorkOrderId} - {WorkOrderExternalReference}"
+  # Format de date en entree (francais) et en sortie
+  date_input_lang: "fr"
+  date_output_format: "%d-%m-%Y"
+
+# --- Step 3 : Mapping Excel -> HubSpot ---
+hubspot_mapping:
+  Nom:                        "lastname"
+  WorkOrderId:                "workorderid"
+  WorkOrderExternalReference: "workorderexternalreference"
+  "E EAN Number":             "code_ean"
+  CustomerName:               "firstname"
+  "Adresse postale":          "address"
+  HouseNumber:                "numero_de_rue"
+  ZipCode:                    "zip"
+  City:                       "city"
+  Language:                   "hs_language"
+  AppointmentDate:            "jobtitle"
+  "Appointment Window":       "company"
+  Login:                      "login"
+  Password:                   "password"
+  "Login Url":                "login_url"
+  GRD:                        "grd"
+
+# Proprietes HubSpot de type "number" (valeurs > 2^53 seront ignorees)
+hubspot_number_props:
+  - "workorderid"
+  - "code_ean"
+  - "numero_de_rue"
+
+# --- Step 3 : Mapping Excel -> PostgreSQL ---
+# Ordre des colonnes dans la table dataformails
+postgresql_columns:
+  - { excel: "CreationDate",              pg: "CreationDate" }
+  - { excel: "WorkOrderId",              pg: "WorkOrderId" }
+  - { excel: "WorkOrderExternalReference", pg: "WorkOrderExternalReference" }
+  - { excel: "E EAN Number",             pg: "E EAN Number" }
+  - { excel: "CustomerName",             pg: "CustomerName" }
+  - { excel: "Adresse postale",          pg: "adresse postale" }
+  - { excel: "Street",                   pg: "Street" }
+  - { excel: "HouseNumber",             pg: "HouseNumber" }
+  - { excel: "PostBox",                  pg: "PostBox" }
+  - { excel: "ZipCode",                  pg: "ZipCode" }
+  - { excel: "City",                     pg: "City" }
+  - { excel: "Language",                 pg: "Language" }
+  - { excel: "AppointmentDate",          pg: "AppointmentDate" }
+  - { excel: "Appointment Window",       pg: "Appointment Window" }
+  - { excel: "Login",                    pg: "Login" }
+  - { excel: "Password",                pg: "Password" }
+  - { excel: "Login Url",               pg: "Login Url" }
+  - { excel: "GRD",                     pg: "GRD" }
+
+# --- Repartition des taches ---
+# Owners qui recoivent les taches (round-robin)
+task_owners:
+  - { id: "9460622",   name: "Anas BELLAL" }
+  - { id: "10006337",  name: "Omraam Bankanguila" }
+  - { id: "30213298",  name: "Yassine Bounouh" }
+  - { id: "30213299",  name: "Nali Likibi" }
+  - { id: "30213300",  name: "Sublime Dzassouka" }
+  - { id: "30213301",  name: "Mbarek Hemmam" }
+  - { id: "30213303",  name: "Mehdi Karroum" }
+  - { id: "30213304",  name: "Yassine Chraibi" }
+  - { id: "30213824",  name: "Sabrine Meddeb" }
+  - { id: "31229265",  name: "HAROLD AKOLI" }
+  - { id: "33205782",  name: "Saad Hajir" }
+  - { id: "33205908",  name: "Achraf ENNAJAH" }
+
+# Owners exclus de la repartition (ne recoivent PAS de taches)
+excluded_owners:
+  - { id: "30134213",  name: "Aziz Assafi" }
+  - { id: "83108828",  name: "Sofian Hakmi" }
+  - { id: "9768132",   name: "Oussama Essakhi" }
+  - { id: "10080929",  name: "Kawtar EL BAZ" }
+  - { id: "30687282",  name: "Mouad FIALI" }
+  - { id: "31499142",  name: "Ilham MARGHALA" }
+
+# Owner par defaut pour les contacts
+default_owner_id: "83108828"
+
+# --- Parametres batch ---
+batch:
+  contacts_size: 100      # Max HubSpot = 100
+  tasks_size: 100         # Max HubSpot = 100
+  list_members_size: 250  # Max HubSpot = 250
+  rate_limit_pause: 11    # Pause en secondes si rate limit (429)
+
+# --- Logs ---
+logs:
+  directory: "logs"       # Dossier ou sauvegarder les logs
+  keep_days: 30           # Supprimer les logs de plus de N jours
