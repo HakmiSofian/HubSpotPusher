@@ -705,7 +705,8 @@ def step3_hubspot(df, config, logger, list_name, progress_callback=None, task_ow
 def scan_orphan_tasks(config, progress_callback=None):
     """
     Scanne les taches HubSpot et identifie celles sans contact associe.
-    Utilise l'API Search paginee par mois + Batch Associations v4 concurrentes.
+    Phase 1 : fenetres adaptatives paralleles (30j -> 7j -> 1j, 8 workers).
+    Phase 2 : associations batch v4 paralleles (8 workers).
     Retourne la liste des IDs orphelins et le total scanne.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -727,9 +728,9 @@ def scan_orphan_tasks(config, progress_callback=None):
                 return resp
             return resp
 
-    # 1. Recuperer toutes les taches avec fenetres adaptatives (30j → 7j → 1j)
-    all_task_ids = []
-    task_id_set = set()  # eviter les doublons entre fenetres
+    # 1. Recuperer toutes les taches avec fenetres adaptatives paralleles (30j -> 7j -> 1j)
+    task_id_set = set()
+    lock = threading.Lock()
     start_date = datetime(2024, 1, 1)
     end_date = datetime.now() + timedelta(days=1)
     total_days = (end_date - start_date).days
@@ -768,37 +769,52 @@ def scan_orphan_tasks(config, progress_callback=None):
             after = int(next_after)
         return ids, False
 
-    # File de fenetres a traiter : (start, end, window_days)
-    windows_queue = []
+    def process_windows(windows):
+        """Traite une liste de fenetres en parallele, retourne celles a redecouper."""
+        needs_split = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_map = {
+                executor.submit(fetch_window, ws, we): (ws, we, wd)
+                for ws, we, wd in windows
+            }
+            for future in as_completed(future_map):
+                ws, we, wd = future_map[future]
+                ids, hit_limit = future.result()
+                if hit_limit and wd > 1:
+                    needs_split.append((ws, we, wd))
+                else:
+                    with lock:
+                        for tid in ids:
+                            task_id_set.add(tid)
+                if progress_callback:
+                    with lock:
+                        count = len(task_id_set)
+                    elapsed = (ws - start_date).days
+                    pct = min(elapsed / total_days * 0.4, 0.4)
+                    progress_callback(pct, f"Scan : {count} taches trouvees ({ws.strftime('%Y-%m-%d')} -> {we.strftime('%Y-%m-%d')})...")
+        return needs_split
+
+    # Generer les fenetres initiales de 30 jours
+    windows = []
     current = start_date
     while current < end_date:
         w_end = min(current + timedelta(days=30), end_date)
-        windows_queue.append((current, w_end, 30))
+        windows.append((current, w_end, 30))
         current = w_end
 
-    while windows_queue:
-        win_start, win_end, win_days = windows_queue.pop(0)
-        ids, hit_limit = fetch_window(win_start, win_end)
+    # Lancer en parallele, redecouper si necessaire (30j -> 7j -> 1j)
+    while windows:
+        needs_split = process_windows(windows)
+        windows = []
+        for ws, we, wd in needs_split:
+            sub_days = 7 if wd >= 30 else 1
+            sub = ws
+            while sub < we:
+                s_end = min(sub + timedelta(days=sub_days), we)
+                windows.append((sub, s_end, sub_days))
+                sub = s_end
 
-        if hit_limit and win_days > 1:
-            # Decouper en sous-fenetres plus petites
-            sub_days = 7 if win_days >= 30 else 1
-            sub_current = win_start
-            while sub_current < win_end:
-                sub_end = min(sub_current + timedelta(days=sub_days), win_end)
-                windows_queue.append((sub_current, sub_end, sub_days))
-                sub_current = sub_end
-        else:
-            # Ajouter les IDs (dedupliques)
-            for tid in ids:
-                if tid not in task_id_set:
-                    task_id_set.add(tid)
-                    all_task_ids.append(tid)
-
-        elapsed_days = (win_start - start_date).days
-        if progress_callback and total_days > 0:
-            pct = min(elapsed_days / total_days * 0.4, 0.4)
-            progress_callback(pct, f"Scan : {len(all_task_ids)} taches trouvees ({win_start.strftime('%Y-%m-%d')} → {win_end.strftime('%Y-%m-%d')})...")
+    all_task_ids = list(task_id_set)
 
     if progress_callback:
         progress_callback(0.4, f"{len(all_task_ids)} taches trouvees. Verification des associations...")
