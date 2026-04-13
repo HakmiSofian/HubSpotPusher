@@ -820,11 +820,11 @@ def scan_orphan_tasks(config, progress_callback=None):
     if progress_callback:
         progress_callback(0.4, f"{len(all_task_ids)} taches trouvees. Verification des associations...")
 
-    # 2. Verifier les associations par batch de 100 — en parallele (8 workers)
+    # 2. Verifier les associations par batch de 100 (4 workers)
     orphan_ids = []
     associated_count = 0
-    lock = threading.Lock()
-    checked_count = [0]  # mutable pour le callback
+    skipped_count = [0]
+    checked_count = [0]
 
     def check_association_batch(batch):
         inputs = [{'id': str(tid)} for tid in batch]
@@ -834,12 +834,12 @@ def scan_orphan_tasks(config, progress_callback=None):
         )
         local_orphans = []
         local_associated = 0
+        local_skipped = 0
         if resp.status_code == 200:
             associated_ids = set()
             for r in resp.json().get('results', []):
                 from_id = str(r.get('from', {}).get('id', ''))
                 to_list = r.get('to') or []
-                # Verifier qu'il y a au moins un contact avec un vrai ID
                 has_real_contact = any(
                     t.get('toObjectId') or t.get('id')
                     for t in to_list
@@ -852,30 +852,32 @@ def scan_orphan_tasks(config, progress_callback=None):
                 else:
                     local_orphans.append(str(tid))
         else:
-            # Batch echoue apres 5 retries : compter comme orphelines
-            # plutot que de les ignorer silencieusement
-            for tid in batch:
-                local_orphans.append(str(tid))
-        return local_orphans, local_associated
+            # Batch echoue : IGNORER (ne PAS compter comme orphelines)
+            local_skipped = len(batch)
+        return local_orphans, local_associated, local_skipped
 
     batches = [all_task_ids[i:i + 100] for i in range(0, len(all_task_ids), 100)]
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(check_association_batch, batch): batch for batch in batches}
         for future in as_completed(futures):
-            local_orphans, local_associated = future.result()
+            local_orphans, local_associated, local_skipped = future.result()
             with lock:
                 orphan_ids.extend(local_orphans)
                 associated_count += local_associated
+                skipped_count[0] += local_skipped
                 checked_count[0] += len(futures[future])
             if progress_callback:
                 with lock:
                     checked = checked_count[0]
+                    skipped = skipped_count[0]
                 pct = 0.4 + min(checked / max(len(all_task_ids), 1) * 0.6, 0.6)
-                progress_callback(pct, f"Associations : {checked}/{len(all_task_ids)} — {len(orphan_ids)} orpheline(s)")
+                skip_msg = f" ({skipped} non-verifiees)" if skipped > 0 else ""
+                progress_callback(pct, f"Associations : {checked}/{len(all_task_ids)} -- {len(orphan_ids)} orpheline(s){skip_msg}")
 
     if progress_callback:
-        progress_callback(1.0, f"Termine : {len(orphan_ids)} orpheline(s) sur {len(all_task_ids)}")
+        skip_msg = f" ({skipped_count[0]} non-verifiees)" if skipped_count[0] > 0 else ""
+        progress_callback(1.0, f"Termine : {len(orphan_ids)} orpheline(s) sur {len(all_task_ids)}{skip_msg}")
 
     return orphan_ids, len(all_task_ids), associated_count
 
@@ -994,6 +996,16 @@ def main():
 
             if len(orphan_ids) > 0:
                 st.warning(f"**{len(orphan_ids)} tache(s) orpheline(s)** detectee(s) — sans aucun contact associe.")
+
+                # Bouton CSV de backup avant suppression
+                csv_data = "task_id\n" + "\n".join(orphan_ids)
+                st.download_button(
+                    "Telecharger CSV (backup rollback)",
+                    data=csv_data,
+                    file_name=f"orphan_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="orphan_csv_btn"
+                )
 
                 if st.checkbox("Je confirme la suppression de ces taches orphelines", key="confirm_orphan"):
                     if st.button(f"Supprimer {len(orphan_ids)} tache(s) orpheline(s)", key="delete_orphan_btn", type="primary"):
