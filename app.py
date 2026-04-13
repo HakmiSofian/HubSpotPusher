@@ -730,6 +730,7 @@ def scan_orphan_tasks(config, progress_callback=None):
 
     # 1. Recuperer toutes les taches avec fenetres adaptatives paralleles (30j -> 7j -> 1j)
     task_id_set = set()
+    task_details = {}  # id -> {subject, date, status}
     lock = threading.Lock()
     start_date = datetime(2024, 1, 1)
     end_date = datetime.now() + timedelta(days=1)
@@ -747,7 +748,7 @@ def scan_orphan_tasks(config, progress_callback=None):
         while True:
             payload = {
                 'limit': 100,
-                'properties': ['hs_task_subject'],
+                'properties': ['hs_task_subject', 'hs_createdate', 'hs_task_status', 'hubspot_owner_id'],
                 'filterGroups': [{'filters': [
                     {'propertyName': 'hs_createdate', 'operator': 'GTE', 'value': s_ms},
                     {'propertyName': 'hs_createdate', 'operator': 'LT', 'value': e_ms},
@@ -760,7 +761,14 @@ def scan_orphan_tasks(config, progress_callback=None):
                 break
             data = resp.json()
             for task in data.get('results', []):
-                ids.append(task['id'])
+                tid = task['id']
+                props = task.get('properties', {})
+                ids.append((tid, {
+                    'subject': props.get('hs_task_subject', ''),
+                    'date': props.get('hs_createdate', ''),
+                    'status': props.get('hs_task_status', ''),
+                    'owner_id': props.get('hubspot_owner_id', ''),
+                }))
             paging = data.get('paging', {}).get('next', {})
             next_after = paging.get('after')
             if not next_after:
@@ -785,8 +793,10 @@ def scan_orphan_tasks(config, progress_callback=None):
                     needs_split.append((ws, we, wd))
                 else:
                     with lock:
-                        for tid in ids:
-                            task_id_set.add(tid)
+                        for tid, details in ids:
+                            if tid not in task_id_set:
+                                task_id_set.add(tid)
+                                task_details[tid] = details
                 if progress_callback:
                     with lock:
                         count = len(task_id_set)
@@ -879,7 +889,19 @@ def scan_orphan_tasks(config, progress_callback=None):
         skip_msg = f" ({skipped_count[0]} non-verifiees)" if skipped_count[0] > 0 else ""
         progress_callback(1.0, f"Termine : {len(orphan_ids)} orpheline(s) sur {len(all_task_ids)}{skip_msg}")
 
-    return orphan_ids, len(all_task_ids), associated_count
+    # Construire les details des orphelines pour le preview
+    orphan_details = []
+    for oid in orphan_ids:
+        d = task_details.get(oid, {})
+        orphan_details.append({
+            'ID': oid,
+            'Sujet': d.get('subject', ''),
+            'Date creation': d.get('date', '')[:10] if d.get('date') else '',
+            'Statut': d.get('status', ''),
+            'Owner ID': d.get('owner_id', ''),
+        })
+
+    return orphan_ids, len(all_task_ids), associated_count, orphan_details
 
 
 def delete_orphan_tasks(orphan_ids, config, progress_callback=None):
@@ -968,6 +990,7 @@ def main():
             st.session_state['orphan_ids'] = None
             st.session_state['orphan_total'] = 0
             st.session_state['orphan_associated'] = 0
+            st.session_state['orphan_details'] = []
 
         # Bouton scanner
         if st.button("Lancer le scan", key="orphan_scan_btn", type="primary"):
@@ -978,10 +1001,11 @@ def main():
                 progress_o.progress(min(pct, 1.0))
                 msg_o.text(msg)
 
-            orphan_ids, total_scanned, associated = scan_orphan_tasks(config, cb_orphan)
+            orphan_ids, total_scanned, associated, orphan_details = scan_orphan_tasks(config, cb_orphan)
             st.session_state['orphan_ids'] = orphan_ids
             st.session_state['orphan_total'] = total_scanned
             st.session_state['orphan_associated'] = associated
+            st.session_state['orphan_details'] = orphan_details
 
         # Afficher les resultats du scan
         if st.session_state.get('orphan_ids') is not None:
@@ -997,8 +1021,17 @@ def main():
             if len(orphan_ids) > 0:
                 st.warning(f"**{len(orphan_ids)} tache(s) orpheline(s)** detectee(s) — sans aucun contact associe.")
 
-                # Bouton CSV de backup avant suppression
-                csv_data = "task_id\n" + "\n".join(orphan_ids)
+                # Preview des orphelines
+                orphan_details = st.session_state.get('orphan_details', [])
+                if orphan_details:
+                    df_preview = pd.DataFrame(orphan_details)
+                    st.dataframe(df_preview, height=300)
+
+                # Bouton CSV de backup avant suppression (avec details)
+                if orphan_details:
+                    csv_data = pd.DataFrame(orphan_details).to_csv(index=False)
+                else:
+                    csv_data = "task_id\n" + "\n".join(orphan_ids)
                 st.download_button(
                     "Telecharger CSV (backup rollback)",
                     data=csv_data,
