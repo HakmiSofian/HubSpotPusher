@@ -727,30 +727,29 @@ def scan_orphan_tasks(config, progress_callback=None):
                 return resp
             return resp
 
-    # 1. Recuperer toutes les taches par fenetres de 30 jours (au lieu de 1 jour)
+    # 1. Recuperer toutes les taches avec fenetres adaptatives (30j → 7j → 1j)
     all_task_ids = []
+    task_id_set = set()  # eviter les doublons entre fenetres
     start_date = datetime(2024, 1, 1)
     end_date = datetime.now() + timedelta(days=1)
-    current = start_date
     total_days = (end_date - start_date).days
-    WINDOW_DAYS = 30
 
     if progress_callback:
         progress_callback(0.0, "Scan des taches HubSpot...")
 
-    while current < end_date:
-        window_end = min(current + timedelta(days=WINDOW_DAYS), end_date)
-        start_ms = str(int(current.timestamp() * 1000))
-        end_ms = str(int(window_end.timestamp() * 1000))
+    def fetch_window(win_start, win_end):
+        """Recupere les taches d'une fenetre. Retourne (ids, hit_limit)."""
+        s_ms = str(int(win_start.timestamp() * 1000))
+        e_ms = str(int(win_end.timestamp() * 1000))
+        ids = []
         after = 0
-
         while True:
             payload = {
                 'limit': 100,
                 'properties': ['hs_task_subject'],
                 'filterGroups': [{'filters': [
-                    {'propertyName': 'hs_createdate', 'operator': 'GTE', 'value': start_ms},
-                    {'propertyName': 'hs_createdate', 'operator': 'LT', 'value': end_ms},
+                    {'propertyName': 'hs_createdate', 'operator': 'GTE', 'value': s_ms},
+                    {'propertyName': 'hs_createdate', 'operator': 'LT', 'value': e_ms},
                 ]}],
                 'after': after,
             }
@@ -759,19 +758,47 @@ def scan_orphan_tasks(config, progress_callback=None):
                 break
             data = resp.json()
             for task in data.get('results', []):
-                all_task_ids.append(task['id'])
+                ids.append(task['id'])
             paging = data.get('paging', {}).get('next', {})
             next_after = paging.get('after')
-            if not next_after or int(next_after) >= 10000:
+            if not next_after:
                 break
+            if int(next_after) >= 10000:
+                return ids, True  # limite atteinte, il faut decouper
             after = int(next_after)
+        return ids, False
 
-        elapsed_days = (current - start_date).days
+    # File de fenetres a traiter : (start, end, window_days)
+    windows_queue = []
+    current = start_date
+    while current < end_date:
+        w_end = min(current + timedelta(days=30), end_date)
+        windows_queue.append((current, w_end, 30))
+        current = w_end
+
+    while windows_queue:
+        win_start, win_end, win_days = windows_queue.pop(0)
+        ids, hit_limit = fetch_window(win_start, win_end)
+
+        if hit_limit and win_days > 1:
+            # Decouper en sous-fenetres plus petites
+            sub_days = 7 if win_days >= 30 else 1
+            sub_current = win_start
+            while sub_current < win_end:
+                sub_end = min(sub_current + timedelta(days=sub_days), win_end)
+                windows_queue.append((sub_current, sub_end, sub_days))
+                sub_current = sub_end
+        else:
+            # Ajouter les IDs (dedupliques)
+            for tid in ids:
+                if tid not in task_id_set:
+                    task_id_set.add(tid)
+                    all_task_ids.append(tid)
+
+        elapsed_days = (win_start - start_date).days
         if progress_callback and total_days > 0:
             pct = min(elapsed_days / total_days * 0.4, 0.4)
-            progress_callback(pct, f"Scan : {len(all_task_ids)} taches trouvees ({current.strftime('%Y-%m-%d')} → {window_end.strftime('%Y-%m-%d')})...")
-
-        current = window_end
+            progress_callback(pct, f"Scan : {len(all_task_ids)} taches trouvees ({win_start.strftime('%Y-%m-%d')} → {win_end.strftime('%Y-%m-%d')})...")
 
     if progress_callback:
         progress_callback(0.4, f"{len(all_task_ids)} taches trouvees. Verification des associations...")
