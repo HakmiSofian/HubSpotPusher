@@ -720,6 +720,7 @@ def scan_orphan_tasks(config, progress_callback=None):
 
     def api_post(url, payload, use_semaphore=True):
         def _call():
+            resp = None
             for attempt in range(5):
                 try:
                     resp = session.post(url, json=payload, timeout=30)
@@ -839,6 +840,12 @@ def scan_orphan_tasks(config, progress_callback=None):
     all_task_ids = list(task_id_set)
 
     if progress_callback:
+        progress_callback(0.4, f"{len(all_task_ids)} taches trouvees. Pause rate limit puis verification...")
+
+    # Pause pour laisser le rate limit HubSpot se regenerer apres Phase 1
+    time.sleep(12)
+
+    if progress_callback:
         progress_callback(0.4, f"{len(all_task_ids)} taches trouvees. Verification des associations...")
 
     # 2. Verifier les associations par batch de 100 (sequentiel, fiable)
@@ -871,12 +878,14 @@ def scan_orphan_tasks(config, progress_callback=None):
                 else:
                     orphan_ids.append(str(tid))
         else:
+            status = resp.status_code if resp is not None else "timeout"
             skipped_count += len(batch)
 
         if progress_callback:
             checked = min(i + 100, len(all_task_ids))
             pct = 0.4 + min(checked / max(len(all_task_ids), 1) * 0.6, 0.6)
-            skip_msg = f" ({skipped_count} non-verifiees)" if skipped_count > 0 else ""
+            skip_info = f" ({skipped_count} non-verifiees, dernier err: {status})" if skipped_count > 0 else ""
+            skip_msg = skip_info
             progress_callback(pct, f"Associations : {checked}/{len(all_task_ids)} -- {len(orphan_ids)} orpheline(s){skip_msg}")
 
     if progress_callback:
