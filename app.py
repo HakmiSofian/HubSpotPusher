@@ -718,15 +718,26 @@ def scan_orphan_tasks(config, progress_callback=None):
     # Semaphore pour respecter le rate limit HubSpot (max 8 requetes simultanees)
     api_semaphore = threading.Semaphore(8)
 
-    def api_post(url, payload):
-        with api_semaphore:
-            for _ in range(5):
-                resp = session.post(url, json=payload, timeout=30)
+    def api_post(url, payload, use_semaphore=True):
+        def _call():
+            for attempt in range(5):
+                try:
+                    resp = session.post(url, json=payload, timeout=30)
+                except Exception:
+                    time.sleep(2 * (attempt + 1))
+                    continue
                 if resp.status_code == 429:
                     time.sleep(int(resp.headers.get('Retry-After', pause)))
                     continue
+                if resp.status_code >= 500:
+                    time.sleep(2 * (attempt + 1))
+                    continue
                 return resp
             return resp
+        if use_semaphore:
+            with api_semaphore:
+                return _call()
+        return _call()
 
     # 1. Recuperer toutes les taches avec fenetres adaptatives paralleles (30j -> 7j -> 1j)
     task_id_set = set()
@@ -830,22 +841,20 @@ def scan_orphan_tasks(config, progress_callback=None):
     if progress_callback:
         progress_callback(0.4, f"{len(all_task_ids)} taches trouvees. Verification des associations...")
 
-    # 2. Verifier les associations par batch de 100 (4 workers)
+    # 2. Verifier les associations par batch de 100 (sequentiel, fiable)
     orphan_ids = []
     associated_count = 0
-    skipped_count = [0]
-    checked_count = [0]
+    skipped_count = 0
 
-    def check_association_batch(batch):
+    for i in range(0, len(all_task_ids), 100):
+        batch = all_task_ids[i:i + 100]
         inputs = [{'id': str(tid)} for tid in batch]
         resp = api_post(
             'https://api.hubapi.com/crm/v4/associations/tasks/contacts/batch/read',
-            {'inputs': inputs}
+            {'inputs': inputs},
+            use_semaphore=False
         )
-        local_orphans = []
-        local_associated = 0
-        local_skipped = 0
-        if resp.status_code == 200:
+        if resp is not None and resp.status_code == 200:
             associated_ids = set()
             for r in resp.json().get('results', []):
                 from_id = str(r.get('from', {}).get('id', ''))
@@ -858,35 +867,20 @@ def scan_orphan_tasks(config, progress_callback=None):
                     associated_ids.add(from_id)
             for tid in batch:
                 if str(tid) in associated_ids:
-                    local_associated += 1
+                    associated_count += 1
                 else:
-                    local_orphans.append(str(tid))
+                    orphan_ids.append(str(tid))
         else:
-            # Batch echoue : IGNORER (ne PAS compter comme orphelines)
-            local_skipped = len(batch)
-        return local_orphans, local_associated, local_skipped
+            skipped_count += len(batch)
 
-    batches = [all_task_ids[i:i + 100] for i in range(0, len(all_task_ids), 100)]
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(check_association_batch, batch): batch for batch in batches}
-        for future in as_completed(futures):
-            local_orphans, local_associated, local_skipped = future.result()
-            with lock:
-                orphan_ids.extend(local_orphans)
-                associated_count += local_associated
-                skipped_count[0] += local_skipped
-                checked_count[0] += len(futures[future])
-            if progress_callback:
-                with lock:
-                    checked = checked_count[0]
-                    skipped = skipped_count[0]
-                pct = 0.4 + min(checked / max(len(all_task_ids), 1) * 0.6, 0.6)
-                skip_msg = f" ({skipped} non-verifiees)" if skipped > 0 else ""
-                progress_callback(pct, f"Associations : {checked}/{len(all_task_ids)} -- {len(orphan_ids)} orpheline(s){skip_msg}")
+        if progress_callback:
+            checked = min(i + 100, len(all_task_ids))
+            pct = 0.4 + min(checked / max(len(all_task_ids), 1) * 0.6, 0.6)
+            skip_msg = f" ({skipped_count} non-verifiees)" if skipped_count > 0 else ""
+            progress_callback(pct, f"Associations : {checked}/{len(all_task_ids)} -- {len(orphan_ids)} orpheline(s){skip_msg}")
 
     if progress_callback:
-        skip_msg = f" ({skipped_count[0]} non-verifiees)" if skipped_count[0] > 0 else ""
+        skip_msg = f" ({skipped_count} non-verifiees)" if skipped_count > 0 else ""
         progress_callback(1.0, f"Termine : {len(orphan_ids)} orpheline(s) sur {len(all_task_ids)}{skip_msg}")
 
     # Construire les details des orphelines pour le preview
