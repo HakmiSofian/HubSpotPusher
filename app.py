@@ -140,7 +140,7 @@ def create_session(config):
         'Authorization': f'Bearer {config["hubspot"]["api_key"]}',
         'Content-Type': 'application/json',
     })
-    adapter = requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=5)
+    adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
     s.mount('https://', adapter)
     return s
 
@@ -705,36 +705,43 @@ def step3_hubspot(df, config, logger, list_name, progress_callback=None, task_ow
 def scan_orphan_tasks(config, progress_callback=None):
     """
     Scanne les taches HubSpot et identifie celles sans contact associe.
-    Utilise l'API Search paginee par jour + Batch Associations v4.
+    Utilise l'API Search paginee par mois + Batch Associations v4 concurrentes.
     Retourne la liste des IDs orphelins et le total scanne.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
     session = create_session(config)
     pause = config.get('batch', {}).get('rate_limit_pause', 11)
 
-    def api_post(url, payload):
-        for _ in range(5):
-            resp = session.post(url, json=payload, timeout=30)
-            if resp.status_code == 429:
-                time.sleep(int(resp.headers.get('Retry-After', pause)))
-                continue
-            return resp
-        return resp
+    # Semaphore pour respecter le rate limit HubSpot (max 8 requetes simultanees)
+    api_semaphore = threading.Semaphore(8)
 
-    # 1. Recuperer toutes les taches par tranches de jours
-    from datetime import timedelta
+    def api_post(url, payload):
+        with api_semaphore:
+            for _ in range(5):
+                resp = session.post(url, json=payload, timeout=30)
+                if resp.status_code == 429:
+                    time.sleep(int(resp.headers.get('Retry-After', pause)))
+                    continue
+                return resp
+            return resp
+
+    # 1. Recuperer toutes les taches par fenetres de 30 jours (au lieu de 1 jour)
     all_task_ids = []
     start_date = datetime(2024, 1, 1)
     end_date = datetime.now() + timedelta(days=1)
     current = start_date
     total_days = (end_date - start_date).days
+    WINDOW_DAYS = 30
 
     if progress_callback:
         progress_callback(0.0, "Scan des taches HubSpot...")
 
     while current < end_date:
-        next_day = current + timedelta(days=1)
+        window_end = min(current + timedelta(days=WINDOW_DAYS), end_date)
         start_ms = str(int(current.timestamp() * 1000))
-        end_ms = str(int(next_day.timestamp() * 1000))
+        end_ms = str(int(window_end.timestamp() * 1000))
         after = 0
 
         while True:
@@ -747,7 +754,7 @@ def scan_orphan_tasks(config, progress_callback=None):
                 ]}],
                 'after': after,
             }
-            resp = api_post(f'https://api.hubapi.com/crm/v3/objects/tasks/search', payload)
+            resp = api_post('https://api.hubapi.com/crm/v3/objects/tasks/search', payload)
             if resp.status_code != 200:
                 break
             data = resp.json()
@@ -762,40 +769,66 @@ def scan_orphan_tasks(config, progress_callback=None):
         elapsed_days = (current - start_date).days
         if progress_callback and total_days > 0:
             pct = min(elapsed_days / total_days * 0.4, 0.4)
-            progress_callback(pct, f"Scan : {len(all_task_ids)} taches trouvees ({current.strftime('%Y-%m-%d')})...")
+            progress_callback(pct, f"Scan : {len(all_task_ids)} taches trouvees ({current.strftime('%Y-%m-%d')} → {window_end.strftime('%Y-%m-%d')})...")
 
-        current = next_day
+        current = window_end
 
     if progress_callback:
         progress_callback(0.4, f"{len(all_task_ids)} taches trouvees. Verification des associations...")
 
-    # 2. Verifier les associations par batch de 100
+    # 2. Verifier les associations par batch de 100 — en parallele (8 workers)
     orphan_ids = []
     associated_count = 0
+    lock = threading.Lock()
+    checked_count = [0]  # mutable pour le callback
 
-    for i in range(0, len(all_task_ids), 100):
-        batch = all_task_ids[i:i + 100]
+    def check_association_batch(batch):
         inputs = [{'id': str(tid)} for tid in batch]
         resp = api_post(
             'https://api.hubapi.com/crm/v4/associations/tasks/contacts/batch/read',
             {'inputs': inputs}
         )
+        local_orphans = []
+        local_associated = 0
         if resp.status_code == 200:
             associated_ids = set()
             for r in resp.json().get('results', []):
                 from_id = str(r.get('from', {}).get('id', ''))
-                if r.get('to') and len(r['to']) > 0:
+                to_list = r.get('to') or []
+                # Verifier qu'il y a au moins un contact avec un vrai ID
+                has_real_contact = any(
+                    t.get('toObjectId') or t.get('id')
+                    for t in to_list
+                )
+                if has_real_contact:
                     associated_ids.add(from_id)
             for tid in batch:
                 if str(tid) in associated_ids:
-                    associated_count += 1
+                    local_associated += 1
                 else:
-                    orphan_ids.append(str(tid))
+                    local_orphans.append(str(tid))
+        else:
+            # Batch echoue apres 5 retries : compter comme orphelines
+            # plutot que de les ignorer silencieusement
+            for tid in batch:
+                local_orphans.append(str(tid))
+        return local_orphans, local_associated
 
-        if progress_callback:
-            checked = min(i + 100, len(all_task_ids))
-            pct = 0.4 + min(checked / max(len(all_task_ids), 1) * 0.6, 0.6)
-            progress_callback(pct, f"Associations : {checked}/{len(all_task_ids)} — {len(orphan_ids)} orpheline(s)")
+    batches = [all_task_ids[i:i + 100] for i in range(0, len(all_task_ids), 100)]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(check_association_batch, batch): batch for batch in batches}
+        for future in as_completed(futures):
+            local_orphans, local_associated = future.result()
+            with lock:
+                orphan_ids.extend(local_orphans)
+                associated_count += local_associated
+                checked_count[0] += len(futures[future])
+            if progress_callback:
+                with lock:
+                    checked = checked_count[0]
+                pct = 0.4 + min(checked / max(len(all_task_ids), 1) * 0.6, 0.6)
+                progress_callback(pct, f"Associations : {checked}/{len(all_task_ids)} — {len(orphan_ids)} orpheline(s)")
 
     if progress_callback:
         progress_callback(1.0, f"Termine : {len(orphan_ids)} orpheline(s) sur {len(all_task_ids)}")
