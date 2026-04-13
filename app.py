@@ -700,6 +700,139 @@ def step3_hubspot(df, config, logger, list_name, progress_callback=None, task_ow
 
     return results
 
+# ─── NETTOYAGE TACHES ORPHELINES ─────────────────────────────────────────────
+
+def scan_orphan_tasks(config, progress_callback=None):
+    """
+    Scanne les taches HubSpot et identifie celles sans contact associe.
+    Utilise l'API Search paginee par jour + Batch Associations v4.
+    Retourne la liste des IDs orphelins et le total scanne.
+    """
+    session = create_session(config)
+    pause = config.get('batch', {}).get('rate_limit_pause', 11)
+
+    def api_post(url, payload):
+        for _ in range(5):
+            resp = session.post(url, json=payload, timeout=30)
+            if resp.status_code == 429:
+                time.sleep(int(resp.headers.get('Retry-After', pause)))
+                continue
+            return resp
+        return resp
+
+    # 1. Recuperer toutes les taches par tranches de jours
+    from datetime import timedelta
+    all_task_ids = []
+    start_date = datetime(2024, 1, 1)
+    end_date = datetime.now() + timedelta(days=1)
+    current = start_date
+    total_days = (end_date - start_date).days
+
+    if progress_callback:
+        progress_callback(0.0, "Scan des taches HubSpot...")
+
+    while current < end_date:
+        next_day = current + timedelta(days=1)
+        start_ms = str(int(current.timestamp() * 1000))
+        end_ms = str(int(next_day.timestamp() * 1000))
+        after = 0
+
+        while True:
+            payload = {
+                'limit': 100,
+                'properties': ['hs_task_subject'],
+                'filterGroups': [{'filters': [
+                    {'propertyName': 'hs_createdate', 'operator': 'GTE', 'value': start_ms},
+                    {'propertyName': 'hs_createdate', 'operator': 'LT', 'value': end_ms},
+                ]}],
+                'after': after,
+            }
+            resp = api_post(f'https://api.hubapi.com/crm/v3/objects/tasks/search', payload)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            for task in data.get('results', []):
+                all_task_ids.append(task['id'])
+            paging = data.get('paging', {}).get('next', {})
+            next_after = paging.get('after')
+            if not next_after or int(next_after) >= 10000:
+                break
+            after = int(next_after)
+
+        elapsed_days = (current - start_date).days
+        if progress_callback and total_days > 0:
+            pct = min(elapsed_days / total_days * 0.4, 0.4)
+            progress_callback(pct, f"Scan : {len(all_task_ids)} taches trouvees ({current.strftime('%Y-%m-%d')})...")
+
+        current = next_day
+
+    if progress_callback:
+        progress_callback(0.4, f"{len(all_task_ids)} taches trouvees. Verification des associations...")
+
+    # 2. Verifier les associations par batch de 100
+    orphan_ids = []
+    associated_count = 0
+
+    for i in range(0, len(all_task_ids), 100):
+        batch = all_task_ids[i:i + 100]
+        inputs = [{'id': str(tid)} for tid in batch]
+        resp = api_post(
+            'https://api.hubapi.com/crm/v4/associations/tasks/contacts/batch/read',
+            {'inputs': inputs}
+        )
+        if resp.status_code == 200:
+            associated_ids = set()
+            for r in resp.json().get('results', []):
+                from_id = str(r.get('from', {}).get('id', ''))
+                if r.get('to') and len(r['to']) > 0:
+                    associated_ids.add(from_id)
+            for tid in batch:
+                if str(tid) in associated_ids:
+                    associated_count += 1
+                else:
+                    orphan_ids.append(str(tid))
+
+        if progress_callback:
+            checked = min(i + 100, len(all_task_ids))
+            pct = 0.4 + min(checked / max(len(all_task_ids), 1) * 0.6, 0.6)
+            progress_callback(pct, f"Associations : {checked}/{len(all_task_ids)} — {len(orphan_ids)} orpheline(s)")
+
+    if progress_callback:
+        progress_callback(1.0, f"Termine : {len(orphan_ids)} orpheline(s) sur {len(all_task_ids)}")
+
+    return orphan_ids, len(all_task_ids), associated_count
+
+
+def delete_orphan_tasks(orphan_ids, config, progress_callback=None):
+    """Supprime les taches orphelines par batch de 100."""
+    session = create_session(config)
+    pause = config.get('batch', {}).get('rate_limit_pause', 11)
+    deleted = 0
+
+    for i in range(0, len(orphan_ids), 100):
+        batch = orphan_ids[i:i + 100]
+        inputs = [{'id': tid} for tid in batch]
+
+        for _ in range(3):
+            resp = session.post(
+                'https://api.hubapi.com/crm/v3/objects/tasks/batch/archive',
+                json={'inputs': inputs}, timeout=30
+            )
+            if resp.status_code == 429:
+                time.sleep(int(resp.headers.get('Retry-After', pause)))
+                continue
+            break
+
+        if resp.status_code in (200, 204):
+            deleted += len(batch)
+
+        if progress_callback:
+            pct = min((i + 100) / len(orphan_ids), 1.0)
+            progress_callback(pct, f"Suppression : {deleted}/{len(orphan_ids)}")
+
+    return deleted
+
+
 # ─── Interface Streamlit ──────────────────────────────────────────────────────
 
 def main():
@@ -739,6 +872,71 @@ def main():
                 selected_owners.append(owner)
 
         st.caption(f"{len(selected_owners)} agent(s) selectionne(s)")
+
+        # ── Outils de maintenance ──
+        st.divider()
+        st.subheader("Outils")
+        if st.button("Nettoyer taches orphelines", key="orphan_btn", help="Trouve et supprime les taches HubSpot sans contact associe"):
+            st.session_state['show_orphan_tool'] = True
+
+    # ── Module nettoyage taches orphelines ──
+    if st.session_state.get('show_orphan_tool', False):
+        st.divider()
+        st.subheader("Nettoyage taches orphelines HubSpot")
+        st.caption("Trouve les taches sans contact associe (erreurs d'import, tests, etc.) et les supprime.")
+
+        if 'orphan_ids' not in st.session_state:
+            st.session_state['orphan_ids'] = None
+            st.session_state['orphan_total'] = 0
+            st.session_state['orphan_associated'] = 0
+
+        # Bouton scanner
+        if st.button("Lancer le scan", key="orphan_scan_btn", type="primary"):
+            progress_o = st.progress(0)
+            msg_o = st.empty()
+
+            def cb_orphan(pct, msg):
+                progress_o.progress(min(pct, 1.0))
+                msg_o.text(msg)
+
+            orphan_ids, total_scanned, associated = scan_orphan_tasks(config, cb_orphan)
+            st.session_state['orphan_ids'] = orphan_ids
+            st.session_state['orphan_total'] = total_scanned
+            st.session_state['orphan_associated'] = associated
+
+        # Afficher les resultats du scan
+        if st.session_state.get('orphan_ids') is not None:
+            orphan_ids = st.session_state['orphan_ids']
+            total_scanned = st.session_state['orphan_total']
+            associated = st.session_state['orphan_associated']
+
+            col_o1, col_o2, col_o3 = st.columns(3)
+            col_o1.metric("Taches scannees", total_scanned)
+            col_o2.metric("Avec contact", associated)
+            col_o3.metric("Orphelines", len(orphan_ids))
+
+            if len(orphan_ids) > 0:
+                st.warning(f"**{len(orphan_ids)} tache(s) orpheline(s)** detectee(s) — sans aucun contact associe.")
+
+                if st.checkbox("Je confirme la suppression de ces taches orphelines", key="confirm_orphan"):
+                    if st.button(f"Supprimer {len(orphan_ids)} tache(s) orpheline(s)", key="delete_orphan_btn", type="primary"):
+                        progress_del = st.progress(0)
+                        msg_del = st.empty()
+
+                        def cb_del(pct, msg):
+                            progress_del.progress(min(pct, 1.0))
+                            msg_del.text(msg)
+
+                        deleted = delete_orphan_tasks(orphan_ids, config, cb_del)
+                        st.success(f"✅ {deleted} tache(s) orpheline(s) supprimee(s) !")
+                        st.session_state['orphan_ids'] = None
+            else:
+                st.success("✅ Aucune tache orpheline — tout est propre !")
+
+        if st.button("Fermer", key="close_orphan"):
+            st.session_state['show_orphan_tool'] = False
+            st.session_state['orphan_ids'] = None
+            st.rerun()
 
     # Upload fichier
     uploaded = st.file_uploader(
