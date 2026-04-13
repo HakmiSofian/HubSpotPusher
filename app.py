@@ -751,6 +751,7 @@ def scan_orphan_tasks(config, progress_callback=None):
                 'filterGroups': [{'filters': [
                     {'propertyName': 'hs_createdate', 'operator': 'GTE', 'value': s_ms},
                     {'propertyName': 'hs_createdate', 'operator': 'LT', 'value': e_ms},
+                    {'propertyName': 'hs_task_status', 'operator': 'NEQ', 'value': 'COMPLETED'},
                 ]}],
                 'after': after,
             }
