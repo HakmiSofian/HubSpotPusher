@@ -861,9 +861,12 @@ def scan_orphan_tasks(config, progress_callback=None):
             {'inputs': inputs},
             use_semaphore=False
         )
-        if resp is not None and resp.status_code == 200:
+        if resp is not None and resp.status_code in (200, 207):
+            # 200 = toutes les taches ont un contact
+            # 207 = reponse mixte : results (avec contact) + errors (orphelines)
+            data = resp.json()
             associated_ids = set()
-            for r in resp.json().get('results', []):
+            for r in data.get('results', []):
                 from_id = str(r.get('from', {}).get('id', ''))
                 to_list = r.get('to') or []
                 has_real_contact = any(
