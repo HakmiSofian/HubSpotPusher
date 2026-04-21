@@ -952,6 +952,33 @@ def delete_orphan_tasks(orphan_ids, config, progress_callback=None):
     return deleted
 
 
+# ─── HubSpot Owners ───────────────────────────────────────────────────────────
+
+EXCLUDED_FIRST_NAMES = {'aziz', 'sofian', 'ilham', 'oussama', 'kawtar', 'mouad'}
+
+def fetch_hubspot_owners(config):
+    """Liste tous les owners actifs HubSpot (API /crm/v3/owners, pagine)."""
+    session = create_session(config)
+    owners = []
+    url = 'https://api.hubapi.com/crm/v3/owners/?limit=100'
+    while url:
+        resp = session.get(url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        for o in data.get('results', []):
+            if o.get('archived'):
+                continue
+            name = f"{o.get('firstName', '')} {o.get('lastName', '')}".strip() or o.get('email', '')
+            owners.append({'id': str(o['id']), 'name': name})
+        url = data.get('paging', {}).get('next', {}).get('link')
+    owners.sort(key=lambda o: o['name'].lower())
+    return owners
+
+def owner_default_checked(name):
+    n = name.lower()
+    return not any(ex in n for ex in EXCLUDED_FIRST_NAMES)
+
+
 # ─── Interface Streamlit ──────────────────────────────────────────────────────
 
 def main():
@@ -977,14 +1004,35 @@ def main():
 
         # Checkboxes pour selectionner les agents
         st.subheader("Agents (repartition taches)")
-        all_owners = config.get('task_owners', []) + config.get('excluded_owners', [])
-        active_ids = {o['id'] for o in config.get('task_owners', [])}
+
+        # Bouton de rafraichissement : recupere la liste actuelle depuis HubSpot
+        if st.button("🔄 Mettre a jour la liste des agents", key="refresh_owners_btn",
+                     help="Recupere la liste actuelle des agents depuis HubSpot"):
+            try:
+                with st.spinner("Recuperation des agents HubSpot..."):
+                    fresh = fetch_hubspot_owners(config)
+                st.session_state['hubspot_owners'] = fresh
+                # Reset les checkboxes pour que les defauts s'appliquent
+                for k in list(st.session_state.keys()):
+                    if k.startswith('owner_'):
+                        del st.session_state[k]
+                st.success(f"{len(fresh)} agents recuperes")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Erreur recuperation agents : {e}")
+
+        # Source de la liste : API si rafraichie, sinon config
+        if 'hubspot_owners' in st.session_state:
+            all_owners = st.session_state['hubspot_owners']
+            st.caption(f"Liste HubSpot : {len(all_owners)} agents")
+        else:
+            all_owners = config.get('task_owners', []) + config.get('excluded_owners', [])
 
         selected_owners = []
         for owner in all_owners:
             checked = st.checkbox(
                 f"{owner['name']}",
-                value=(owner['id'] in active_ids),
+                value=owner_default_checked(owner['name']),
                 key=f"owner_{owner['id']}"
             )
             if checked:
