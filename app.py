@@ -77,11 +77,18 @@ FRENCH_MONTHS = {
     'fevrier': '02', 'aout': '08',
 }
 
+ISO_DATE_PATTERN = re.compile(r'^(\d{4})-(\d{2})-(\d{2})(?:[\sT].*)?$')
+
 def parse_french_date(text):
-    """Convertit 'jeudi 23 avril 2026' en '23-04-2026'."""
+    """Convertit 'jeudi 23 avril 2026' ou '2026-04-23 00:00:00' en '23-04-2026'."""
     if pd.isna(text) or str(text).strip() == '':
         return text
-    text = str(text).strip().lower()
+    raw = str(text).strip()
+    iso_match = ISO_DATE_PATTERN.match(raw)
+    if iso_match:
+        year, month, day = iso_match.groups()
+        return f"{day}-{month}-{year}"
+    text = raw.lower()
     for month_name, month_num in FRENCH_MONTHS.items():
         if month_name in text:
             parts = text.split()
@@ -94,7 +101,7 @@ def parse_french_date(text):
                     year = p
             if day and year:
                 return f"{day}-{month_num}-{year}"
-    return text
+    return raw
 
 def safe_str(val):
     if val is None or str(val).strip() in ('', 'nan', 'None'):
@@ -222,13 +229,18 @@ def validate_excel(df):
         if len(non_empty) == 0:
             errors.append("Colonne **AppointmentDate** entièrement vide.")
         else:
-            bad_dates = non_empty[~non_empty.str.lower().apply(lambda v: bool(DATE_PATTERN.search(v)))]
+            def _is_valid_date(v):
+                s = v.strip()
+                if ISO_DATE_PATTERN.match(s):
+                    return True
+                return bool(DATE_PATTERN.search(s.lower()))
+            bad_dates = non_empty[~non_empty.apply(_is_valid_date)]
             if len(bad_dates) > 0:
                 exemples = bad_dates.head(3).tolist()
                 warnings.append(
                     f"Colonne **AppointmentDate** : {len(bad_dates)} date(s) au format non reconnu "
                     f"(ex: `{'`, `'.join(exemples)}`). "
-                    f"Format attendu : `jeudi 23 avril 2026`."
+                    f"Formats attendus : `jeudi 23 avril 2026` ou `2026-04-23`."
                 )
 
     # 6. CustomerName vide
@@ -1085,6 +1097,18 @@ def main():
     else:
         df = pd.read_excel(uploaded, dtype=str)
     df.columns = df.columns.str.strip()
+
+    # Normaliser la colonne Login : variantes de casse (login, LOGIN) -> Login
+    if 'Login' not in df.columns:
+        login_variants = [c for c in df.columns if c.lower() == 'login']
+        if login_variants:
+            df = df.rename(columns={login_variants[0]: 'Login'})
+            st.info(f"Colonne `{login_variants[0]}` renommee en `Login`.")
+
+    # Fallback : si pas de Login mais WorkOrderExternalReference, on recopie
+    if 'Login' not in df.columns and 'WorkOrderExternalReference' in df.columns:
+        df['Login'] = df['WorkOrderExternalReference']
+        st.info("Colonne `Login` absente : recopiee depuis `WorkOrderExternalReference` (memes informations).")
 
     st.success(f"**{filename}** charge — {len(df)} lignes, {len(df.columns)} colonnes")
 
