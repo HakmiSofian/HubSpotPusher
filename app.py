@@ -1105,10 +1105,13 @@ def main():
             df = df.rename(columns={login_variants[0]: 'Login'})
             st.info(f"Colonne `{login_variants[0]}` renommee en `Login`.")
 
-    # Fallback : si pas de Login mais WorkOrderExternalReference, on recopie
+    # Fallback : Login <-> WorkOrderExternalReference (memes informations)
     if 'Login' not in df.columns and 'WorkOrderExternalReference' in df.columns:
         df['Login'] = df['WorkOrderExternalReference']
         st.info("Colonne `Login` absente : recopiee depuis `WorkOrderExternalReference` (memes informations).")
+    elif 'WorkOrderExternalReference' not in df.columns and 'Login' in df.columns:
+        df['WorkOrderExternalReference'] = df['Login']
+        st.info("Colonne `WorkOrderExternalReference` absente : recopiee depuis `Login` (memes informations).")
 
     st.success(f"**{filename}** charge — {len(df)} lignes, {len(df.columns)} colonnes")
 
